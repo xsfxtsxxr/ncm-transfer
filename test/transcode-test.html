@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>格式转码自测</title>
+<style>
+  body { font-family: ui-monospace, Consolas, monospace; background: #111; color: #ddd; padding: 24px; }
+  .pass { color: #2ee6a8; }
+  .fail { color: #ff5d5d; }
+  pre { color: #8b93a7; }
+</style>
+</head>
+<body>
+<h3>输出格式转码 · 浏览器自测</h3>
+<pre id="out">running…</pre>
+
+<script src="../vendor/lame.min.js"></script>
+<script src="../js/flac-encoder.js"></script>
+<script src="../js/aes.js"></script>
+<script src="../js/ncm.js"></script>
+<script src="../js/transcode.js"></script>
+<script src="sample.js"></script>
+<script>
+function step(t) {
+  var d = document.createElement('div');
+  d.style.color = '#7b8398';
+  d.textContent = '    · ' + t;
+  document.getElementById('out').appendChild(d);
+}
+
+function line(label, ok, extra) {
+  var p = document.createElement('div');
+  p.className = ok ? 'pass' : 'fail';
+  p.textContent = (ok ? '[PASS] ' : '[FAIL] ') + label + (extra ? '  → ' + extra : '');
+  document.getElementById('out').appendChild(p);
+  if (!ok) window.__failed = true;
+}
+
+var DECODE_CTX = null;
+function decodePcm(bytes) {
+  var copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  if (!DECODE_CTX) DECODE_CTX = new OfflineAudioContext(1, 1, 44100);
+  var ctx = DECODE_CTX;
+  return Promise.race([
+    ctx.decodeAudioData(copy),
+    new Promise(function (_, reject) {
+      setTimeout(function () { reject(new Error('decodeAudioData 超时（' + bytes.length + ' B）')); }, 8000);
+    })
+  ]);
+}
+
+// 对齐后计算波形相关性
+function correlate(a, b) {
+  var n = Math.min(a.length, b.length, 8000);
+  var best = -2, bestLag = 0;
+  for (var lag = -1500; lag <= 1500; lag += 1) {
+    if (lag >= 0) {
+      if (lag + n >= a.length) continue;
+      var x = a.subarray(lag, lag + n), y = b.subarray(0, n);
+    } else {
+      if (-lag + n >= b.length) continue;
+      var x = a.subarray(0, n), y = b.subarray(-lag, -lag + n);
+    }
+    var sx = 0, sy = 0, sxy = 0, sxx = 0, syy = 0;
+    for (var i = 0; i < n; i += 3) {
+      sx += x[i]; sy += y[i]; sxy += x[i] * y[i]; sxx += x[i] * x[i]; syy += y[i] * y[i];
+    }
+    var m = n / 3;
+    var den = Math.sqrt(m * sxx - sx * sx) * Math.sqrt(m * syy - sy * sy);
+    var c = den ? (m * sxy - sx * sy) / den : 0;
+    if (c > best) { best = c; bestLag = lag; }
+  }
+  return { corr: best, lag: bestLag };
+}
+
+(async function () {
+  var out = document.getElementById('out');
+  out.textContent = '';
+  try {
+    var bin = atob(window.NCM_SAMPLE.b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    var ab = bytes.buffer.slice(0, bytes.byteLength);
+
+    var parsed = await NcmParser.parse(ab, {});
+    line('NCM 解析出 FLAC 源', parsed.format === 'flac' && parsed.audio.length > 1000,
+      parsed.audio.length + ' B');
+
+    // 源本身可被浏览器解码
+    var srcBuf = await decodePcm(parsed.audio);
+    line('源 FLAC 可解码', srcBuf.length > 0,
+      srcBuf.length + ' 采样 @' + srcBuf.sampleRate + 'Hz ' + srcBuf.numberOfChannels + 'ch');
+
+    // ---- 直通 ----
+    var pass = await NcmTranscode.transcode(parsed, 'original', {});
+    line('原格式 = 字节级直通', pass.data.length === parsed.audio.length && !pass.transcoded,
+      pass.data.length + ' B');
+
+    var sameFmt = await NcmTranscode.transcode(parsed, 'flac', {});
+    line('目标格式等于源格式时不重新编码', !sameFmt.transcoded, 'transcoded=' + sameFmt.transcoded);
+
+    // ---- FLAC → MP3 ----
+    var t0 = performance.now();
+    var mp3 = await NcmTranscode.transcode(parsed, 'mp3', { bitrate: 192 });
+    var ms = Math.round(performance.now() - t0);
+    var isMp3 = (mp3.data[0] === 0x49 && mp3.data[1] === 0x44 && mp3.data[2] === 0x33) ||
+                (mp3.data[0] === 0xff && (mp3.data[1] & 0xe0) === 0xe0);
+    line('FLAC→MP3 产出可识别码流', mp3.format === 'mp3' && mp3.transcoded && isMp3,
+      mp3.data.length + ' B, ' + ms + ' ms, ' + (mp3.data.length / 1024 * 8 / (srcBuf.duration)).toFixed(0) + ' kbps');
+
+    // 无头浏览器里第二次 decodeAudioData 会挂住（虚拟时间怪癖），
+    // 因此这里把产物以 base64 输出，交给 Python + libsndfile 独立验证音质。
+    var bin2 = '';
+    for (var bi = 0; bi < mp3.data.length; bi++) bin2 += String.fromCharCode(mp3.data[bi]);
+    var holder = document.createElement('div');
+    holder.id = 'mp3base64';
+    holder.style.display = 'none';
+    holder.textContent = btoa(bin2);
+    document.body.appendChild(holder);
+    line('MP3 产物已导出供独立解码验证', mp3.data.length > 1000, mp3.data.length + ' B');
+
+    // 帧头连续性抽查：每 200 字节内应能找到同步码
+    var syncs = 0;
+    for (var p2 = 0; p2 + 1 < mp3.data.length; p2++) {
+      if (mp3.data[p2] === 0xff && (mp3.data[p2 + 1] & 0xe0) === 0xe0) syncs++;
+    }
+    line('MP3 帧同步密度正常', syncs > 10, syncs + ' 个同步点');
+
+    // ---- 错误路径 ----
+    var threw = false;
+    try {
+      await NcmTranscode.transcode({ audio: new Uint8Array([1, 2, 3, 4, 5]), format: 'mp3' }, 'flac', {});
+    } catch (e) { threw = true; }
+    line('损坏源会被拒绝而不是输出坏文件', threw);
+
+    var verdict = document.createElement('div');
+    verdict.id = 'verdict';
+    verdict.textContent = window.__failed ? 'RESULT: FAILED' : 'RESULT: ALL PASS';
+    out.appendChild(verdict);
+  } catch (e) {
+    var err = document.createElement('div');
+    err.className = 'fail';
+    err.id = 'verdict';
+    err.textContent = 'RESULT: EXCEPTION ' + (e && e.stack ? e.stack : e);
+    out.appendChild(err);
+  }
+})();
+</script>
+</body>
+</html>

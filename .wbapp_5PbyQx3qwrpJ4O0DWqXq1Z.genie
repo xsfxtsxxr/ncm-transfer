@@ -1,0 +1,5 @@
+appId: wbapp_5PbyQx3qwrpJ4O0DWqXq1Z
+name: NCM 音乐转换器
+localDir: C:\xsf\projects\ncm-transfer
+appType: web
+entryHtml: index.html

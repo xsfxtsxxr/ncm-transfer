@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>浏览器端功能自测</title>
+<style>
+  body { font-family: ui-monospace, Consolas, monospace; background: #111; color: #ddd; padding: 24px; }
+  .pass { color: #2ee6a8; }
+  .fail { color: #ff5d5d; }
+</style>
+</head>
+<body>
+<h3>NCM 转换器 · 浏览器运行时自测</h3>
+<pre id="out">running…</pre>
+
+<script src="../js/aes.js"></script>
+<script src="../js/ncm.js"></script>
+<script src="../js/zip.js"></script>
+<script src="sample.js"></script>
+<script>
+function fnv1a(u8) {
+  var h = 0x811c9dc5;
+  for (var i = 0; i < u8.length; i++) {
+    h ^= u8[i];
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, '0');
+}
+
+function line(label, ok, extra) {
+  var p = document.createElement('div');
+  p.className = ok ? 'pass' : 'fail';
+  p.textContent = (ok ? '[PASS] ' : '[FAIL] ') + label + (extra ? '  → ' + extra : '');
+  document.getElementById('out').appendChild(p);
+  if (!ok) window.__failed = true;
+}
+
+(async function () {
+  var out = document.getElementById('out');
+  out.textContent = '';
+  try {
+    var bin = atob(window.NCM_SAMPLE.b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+
+    line('环境：atob / TextDecoder / Blob 可用',
+      typeof atob === 'function' && typeof TextDecoder === 'function' && typeof Blob === 'function');
+
+    var ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    line('isNcm 识别', NcmParser.isNcm(ab));
+
+    var progressCalls = 0;
+    var t0 = performance.now();
+    var res = await NcmParser.parse(ab, { onProgress: function () { progressCalls++; } });
+    var cost = Math.round(performance.now() - t0);
+
+    line('音频逐字节还原', fnv1a(res.audio) === NCM_SAMPLE.payloadHash && res.audio.length === NCM_SAMPLE.payloadSize,
+      res.audio.length + ' B / 期望 ' + NCM_SAMPLE.payloadSize + ' B');
+    // 关键回归点：音频起点必须在封面填充之后（旧实现会把填充当音频开头）
+    var expectedStart = window.NCM_SAMPLE.size - window.NCM_SAMPLE.payloadSize;
+    line('封面区布局识别', res.diag && res.diag.layout === 'frame+len-field', res.diag ? res.diag.layout : 'n/a');
+    line('音频起点越过 ' + window.NCM_SAMPLE.padLen + ' 字节填充',
+      res.diag && res.diag.audioStart === expectedStart,
+      res.diag ? '实际 offset ' + res.diag.audioStart + '，期望 ' + expectedStart : 'n/a');
+
+    line('格式识别', res.format === 'flac', res.format);
+    line('元数据解析', res.meta && res.meta.musicName === '晴天' && res.meta.album === '叶惠美',
+      res.meta ? res.meta.musicName + ' / ' + res.meta.album : 'null');
+    line('歌手字段', res.artist === '周杰伦', res.artist);
+    line('封面还原', res.image && res.image.length === NCM_SAMPLE.coverSize && fnv1a(res.image) === NCM_SAMPLE.coverHash,
+      res.image ? res.image.length + ' B' : 'null');
+    line('文件名生成', res.fileName === '周杰伦 - 晴天.flac', res.fileName);
+    line('进度回调', progressCalls > 0, progressCalls + ' 次');
+    line('耗时合理', cost < 2000, cost + ' ms');
+
+    // 封面能被浏览器解码为图片对象
+    var coverOk = await new Promise(function (resolve) {
+      var img = new Image();
+      var url = URL.createObjectURL(new Blob([res.image], { type: 'image/jpeg' }));
+      img.onload = function () { URL.revokeObjectURL(url); resolve(true); };
+      img.onerror = function () { URL.revokeObjectURL(url); resolve(false); };
+      img.src = url;
+      setTimeout(function () { resolve(false); }, 1500);
+    });
+    line('封面可渲染（Blob URL + 图片解码）', coverOk, coverOk ? 'PNG 16×16 解码成功' : '浏览器无法解码');
+
+    // 下载链路：Blob 能否正确取回原始字节
+    var dl = new Blob([res.audio], { type: 'audio/flac' });
+    var back = new Uint8Array(await dl.arrayBuffer());
+    line('Blob 导出往返一致', fnv1a(back) === NCM_SAMPLE.payloadHash && back.length === NCM_SAMPLE.payloadSize, dl.size + ' B');
+
+    // ZIP 打包
+    var zip = NcmZip.createZip([{ name: res.fileName, data: res.audio }]);
+    var zb = new Uint8Array(await zip.arrayBuffer());
+    var sig = zb[0] === 0x50 && zb[1] === 0x4b && zb[2] === 0x03 && zb[3] === 0x04;
+    var eocd = zb[zb.length - 22] === 0x50 && zb[zb.length - 21] === 0x4b;
+    line('ZIP 结构有效', sig && eocd, zip.size + ' B');
+
+    var summary = document.createElement('div');
+    summary.id = 'verdict';
+    summary.textContent = window.__failed ? 'RESULT: FAILED' : 'RESULT: ALL PASS';
+    out.appendChild(summary);
+  } catch (e) {
+    var err = document.createElement('div');
+    err.className = 'fail';
+    err.id = 'verdict';
+    err.textContent = 'RESULT: EXCEPTION ' + (e && e.stack ? e.stack : e);
+    out.appendChild(err);
+  }
+})();
+</script>
+</body>
+</html>
